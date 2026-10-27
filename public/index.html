@@ -1,0 +1,503 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Socket.IO Chat</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            max-width: 760px;
+            margin: 40px auto;
+            padding: 0 16px;
+            font-family: Arial, sans-serif;
+            line-height: 1.5;
+        }
+
+        .status {
+            margin-bottom: 20px;
+            padding: 12px;
+            background: #f3f4f6;
+            border-radius: 8px;
+        }
+
+        .field {
+            display: block;
+            margin: 12px 0;
+        }
+
+        input,
+        select,
+        button {
+            padding: 10px;
+            font: inherit;
+        }
+
+        input {
+            width: 100%;
+            margin-top: 5px;
+        }
+
+        select {
+            margin-left: 8px;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        #sendButton,
+        #loadHistoryButton {
+            margin-top: 8px;
+        }
+
+        #messages {
+            padding: 12px;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            list-style: none;
+        }
+
+        #messages li {
+            padding: 6px 0;
+            overflow-wrap: anywhere;
+            border-bottom: 1px solid #eee;
+        }
+
+        .system {
+            color: #555;
+        }
+
+        .error {
+            color: #b42318;
+        }
+
+        button:disabled,
+        input:disabled,
+        select:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Real-Time Chat</h1>
+
+    <section class="status">
+        <p>
+            Connection:
+            <strong id="connectionStatus">Connecting...</strong>
+        </p>
+
+        <p>
+            Username:
+            <strong id="usernameDisplay">Not authenticated</strong>
+        </p>
+
+        <p>
+            Current room:
+            <strong id="currentRoomDisplay">None</strong>
+        </p>
+    </section>
+
+    <label class="field">
+        Room:
+        <select id="roomSelect" disabled>
+            <option value="general">general</option>
+            <option value="sports">sports</option>
+            <option value="tech">tech</option>
+        </select>
+    </label>
+
+    <label class="field">
+        Private recipient
+        <input
+            id="targetInput"
+            type="text"
+            placeholder="Username (leave blank for room chat)"
+            disabled
+        >
+    </label>
+
+    <button id="loadHistoryButton" disabled>
+        Load Private History
+    </button>
+
+    <label class="field">
+        Message
+        <input
+            id="messageInput"
+            type="text"
+            placeholder="Type a message..."
+            maxlength="2000"
+            disabled
+        >
+    </label>
+
+    <button id="sendButton" disabled>Send</button>
+
+    <h2>Messages</h2>
+    <ul id="messages" aria-live="polite"></ul>
+
+    <script src="/socket.io/socket.io.js"></script>
+
+    <script>
+        const socket = io();
+
+        const connectionStatus =
+            document.getElementById("connectionStatus");
+        const usernameDisplay =
+            document.getElementById("usernameDisplay");
+        const currentRoomDisplay =
+            document.getElementById("currentRoomDisplay");
+        const roomSelect =
+            document.getElementById("roomSelect");
+        const targetInput =
+            document.getElementById("targetInput");
+        const messageInput =
+            document.getElementById("messageInput");
+        const sendButton =
+            document.getElementById("sendButton");
+        const loadHistoryButton =
+            document.getElementById("loadHistoryButton");
+        const messages =
+            document.getElementById("messages");
+
+        let username = "";
+        let authenticated = false;
+        let joinedRoom = "";
+        let isLoadingHistory = false;
+        let pendingLiveMessages = [];
+
+        function addMessage(text, className = "") {
+            const li = document.createElement("li");
+            li.textContent = text;
+
+            if (className) {
+                li.className = className;
+            }
+
+            messages.appendChild(li);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function updateControls() {
+            const ready = socket.connected && authenticated;
+
+            roomSelect.disabled = !ready;
+            targetInput.disabled = !ready;
+            messageInput.disabled = !ready;
+            sendButton.disabled = !ready;
+            loadHistoryButton.disabled = !ready;
+        }
+
+        function sendMessage() {
+            console.log("Send clicked", {
+                connected: socket.connected,
+                authenticated,
+                joinedRoom
+            });
+
+            if (!socket.connected || !authenticated) {
+                addMessage(
+                    "You are not connected or authenticated.",
+                    "error"
+                );
+                return;
+            }
+
+            const text = messageInput.value.trim();
+            const to = targetInput.value.trim();
+
+            if (!text) {
+                addMessage("Message cannot be empty.", "error");
+                return;
+            }
+
+            if (!to && !joinedRoom) {
+                addMessage(
+                    "Join a room before sending a room message.",
+                    "error"
+                );
+                return;
+            }
+
+            sendButton.disabled = true;
+
+            socket.timeout(5000).emit(
+                "message",
+                { text, to },
+                (error, result) => {
+                    sendButton.disabled =
+                        !socket.connected || !authenticated;
+
+                    if (error) {
+                        addMessage(
+                            "No acknowledgement received from the server.",
+                            "error"
+                        );
+                        console.error("Message acknowledgement timeout");
+                        return;
+                    }
+
+                    if (!result) {
+                        addMessage(
+                            "The server returned no message result.",
+                            "error"
+                        );
+                        return;
+                    }
+
+                    if (!result.ok) {
+                        addMessage(
+                            "[Error] " + result.message,
+                            "error"
+                        );
+                        return;
+                    }
+
+                    if (result.target === "private") {
+                        addMessage(
+                            "You → " + result.recipient + ": " + text
+                        );
+                    } else {
+                        addMessage(
+                            "You [#" + result.room + "]: " + text
+                        );
+                    }
+
+                    messageInput.value = "";
+                    messageInput.focus();
+                }
+            );
+        }
+
+        function loadPrivateHistory(otherUsername) {
+            if (!socket.connected || !authenticated) {
+                addMessage(
+                    "Connect and authenticate before loading history.",
+                    "error"
+                );
+                return;
+            }
+
+            const recipient = otherUsername.trim();
+
+            if (!recipient) {
+                addMessage(
+                    "Enter a username to load private history.",
+                    "error"
+                );
+                return;
+            }
+
+            loadHistoryButton.disabled = true;
+
+            socket.timeout(5000).emit(
+                "private-history",
+                recipient,
+                (error, result) => {
+                    loadHistoryButton.disabled =
+                        !socket.connected || !authenticated;
+
+                    if (error) {
+                        addMessage(
+                            "No response received while loading history.",
+                            "error"
+                        );
+                        return;
+                    }
+
+                    if (!result) {
+                        addMessage(
+                            "The server returned no history result.",
+                            "error"
+                        );
+                        return;
+                    }
+
+                    if (!result.ok) {
+                        addMessage(
+                            "[Error] " + result.message,
+                            "error"
+                        );
+                        return;
+                    }
+
+                    addMessage(
+                        "--- Private history with " + recipient + " ---",
+                        "system"
+                    );
+
+                    if (result.messages.length === 0) {
+                        addMessage(
+                            "No previous private messages found.",
+                            "system"
+                        );
+                        return;
+                    }
+
+                    for (const message of result.messages) {
+                        const direction =
+                            message.sender_username.toLowerCase() ===
+                            username.toLowerCase()
+                                ? "You"
+                                : message.sender_username;
+
+                        addMessage(
+                            "[Private] " +
+                            direction +
+                            ": " +
+                            message.content
+                        );
+                    }
+                }
+            );
+        }
+
+        socket.on("connect", () => {
+            connectionStatus.textContent =
+                "Connected — authenticating";
+
+            authenticated = false;
+            username = "";
+            joinedRoom = "";
+            currentRoomDisplay.textContent = "Joining...";
+            usernameDisplay.textContent = "Authenticating...";
+
+            updateControls();
+
+            addMessage(
+                "Socket connected. Waiting for authenticated identity.",
+                "system"
+            );
+        });
+
+        socket.on("current-user", (user) => {
+            username = user.username;
+            authenticated = true;
+
+            connectionStatus.textContent = "Connected";
+            usernameDisplay.textContent = username;
+
+            updateControls();
+
+            addMessage(
+                "Authenticated as " + username + ".",
+                "system"
+            );
+
+            // The server will confirm room joining through its system event.
+            socket.emit("join-room", roomSelect.value);
+        });
+
+        socket.on("disconnect", (reason) => {
+            connectionStatus.textContent = "Disconnected";
+            usernameDisplay.textContent = "Not authenticated";
+            currentRoomDisplay.textContent = "None";
+
+            authenticated = false;
+            username = "";
+            joinedRoom = "";
+            isLoadingHistory = false;
+            pendingLiveMessages = [];
+
+            updateControls();
+
+            addMessage(
+                "Connection lost (" + reason + "). Trying to reconnect...",
+                "error"
+            );
+        });
+
+        socket.on("connect_error", (error) => {
+            connectionStatus.textContent = "Connection failed";
+
+            console.error("Socket connection error:", error.message);
+
+            updateControls();
+        });
+
+        socket.on("system", (text) => {
+            addMessage("[System] " + text, "system");
+
+            if (text.startsWith("You joined #")) {
+                joinedRoom = text.substring("You joined #".length);
+                currentRoomDisplay.textContent = joinedRoom;
+            }
+        });
+
+        roomSelect.addEventListener("change", () => {
+            if (!socket.connected || !authenticated) {
+                return;
+            }
+
+            isLoadingHistory = true;
+            pendingLiveMessages = [];
+            joinedRoom = "";
+
+            currentRoomDisplay.textContent = "Joining...";
+
+            socket.emit("join-room", roomSelect.value);
+        });
+
+        sendButton.addEventListener("click", sendMessage);
+
+        messageInput.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+                sendMessage();
+            }
+        });
+
+        loadHistoryButton.addEventListener("click", () => {
+            loadPrivateHistory(targetInput.value);
+        });
+
+        socket.on("message", (data) => {
+            if (isLoadingHistory && !data.private) {
+                pendingLiveMessages.push(data);
+                return;
+            }
+
+            addMessage(
+                data.private
+                    ? "[Private] " + data.from + ": " + data.text
+                    : "[" + data.room + "] " + data.from + ": " + data.text
+            );
+        });
+
+        socket.on("room-history", (history) => {
+            for (const message of history) {
+                addMessage(
+                    "[" + message.room_name + "] " +
+                    message.sender_username + ": " +
+                    message.content
+                );
+            }
+
+            isLoadingHistory = false;
+
+            for (const message of pendingLiveMessages) {
+                addMessage(
+                    "[" + message.room + "] " +
+                    message.from + ": " +
+                    message.text
+                );
+            }
+
+            pendingLiveMessages = [];
+        });
+
+        updateControls();
+    </script>
+</body>
+</html>
