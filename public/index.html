@@ -148,356 +148,373 @@
     <h2>Messages</h2>
     <ul id="messages" aria-live="polite"></ul>
 
-    <script src="/socket.io/socket.io.js"></script>
+   <script src="/socket.io/socket.io.js"></script>
+<script>
+  // Reconnection is ON: the server now handles refreshes and multiple tabs safely.
+  const socket = io({ timeout: 5000 });
 
-    <script>
-        const socket = io();
+  const connectionStatus = document.getElementById("connectionStatus");
+  const usernameDisplay = document.getElementById("usernameDisplay");
+  const currentRoomDisplay = document.getElementById("currentRoomDisplay");
+  const roomSelect = document.getElementById("roomSelect");
+  const targetInput = document.getElementById("targetInput");
+  const targetStatus = document.getElementById("targetStatus");   // new (optional)
+  const onlineUsersList = document.getElementById("onlineUsers"); // new (optional)
+  const messageInput = document.getElementById("messageInput");
+  const sendButton = document.getElementById("sendButton");
+  const loadHistoryButton = document.getElementById("loadHistoryButton");
+  const messages = document.getElementById("messages");
 
-        const connectionStatus =
-            document.getElementById("connectionStatus");
-        const usernameDisplay =
-            document.getElementById("usernameDisplay");
-        const currentRoomDisplay =
-            document.getElementById("currentRoomDisplay");
-        const roomSelect =
-            document.getElementById("roomSelect");
-        const targetInput =
-            document.getElementById("targetInput");
-        const messageInput =
-            document.getElementById("messageInput");
-        const sendButton =
-            document.getElementById("sendButton");
-        const loadHistoryButton =
-            document.getElementById("loadHistoryButton");
-        const messages =
-            document.getElementById("messages");
+  // id -> { li, tick }. Used for dedupe AND for updating ticks later.
+  const messageEls = new Map();
+  // message-status events that arrive before we rendered the message
+  const earlyStatuses = new Map();
+  // usernames currently online (lowercase)
+  const onlineUsers = new Set();
 
-        let username = "";
-        let authenticated = false;
-        let joinedRoom = "";
-        let isLoadingHistory = false;
-        let pendingLiveMessages = [];
+  let username = "";
+  let authenticated = false;
+  let joinedRoom = "";
+  let isLoadingHistory = false;
+  let pendingLiveMessages = [];
+  let pendingSend = null; // { clientMsgId, text, to } kept until the server acks
 
-        function addMessage(text, className = "") {
-            const li = document.createElement("li");
-            li.textContent = text;
+  const TICKS = { sent: "✓", delivered: "✓✓", read: "✓✓" };
 
-            if (className) {
-                li.className = className;
-            }
+  function setTick(entry, status) {
+    if (!entry || !entry.tick) return;
+    entry.tick.textContent = TICKS[status] || "";
+    entry.tick.className = "tick " + status;
+  }
 
-            messages.appendChild(li);
-            messages.scrollTop = messages.scrollHeight;
+  function addMessage(text, className = "", messageId = null, status = null) {
+    if (messageId !== null) {
+      const existing = messageEls.get(messageId);
+      if (existing) {
+        // Duplicate: don't render twice, but allow a tick upgrade (e.g. from history)
+        if (status) setTick(existing, status);
+        return;
+      }
+    }
+
+    const li = document.createElement("li");
+    if (className) li.className = className;
+
+    const span = document.createElement("span");
+    span.textContent = text;
+    li.appendChild(span);
+
+    let tick = null;
+    if (status) {
+      tick = document.createElement("span");
+      li.appendChild(tick);
+    }
+
+    messages.appendChild(li);
+    messages.scrollTop = messages.scrollHeight;
+
+    if (messageId !== null) {
+      const entry = { li, tick };
+      messageEls.set(messageId, entry);
+      if (status) {
+        const early = earlyStatuses.get(messageId);
+        setTick(entry, early || status);
+        earlyStatuses.delete(messageId);
+      }
+    }
+  }
+
+  // ---------- presence ----------
+  function renderPresence() {
+    if (onlineUsersList) {
+      onlineUsersList.textContent = "";
+      for (const name of [...onlineUsers].sort()) {
+        if (name === username.toLowerCase()) continue; // don't list yourself
+        const li = document.createElement("li");
+        li.textContent = "● " + name;
+        li.className = "online";
+        li.addEventListener("click", () => {
+          targetInput.value = name;
+          renderTargetStatus();
+        });
+        onlineUsersList.appendChild(li);
+      }
+    }
+    renderTargetStatus();
+  }
+
+  function renderTargetStatus() {
+    if (!targetStatus) return;
+    const t = targetInput.value.trim().toLowerCase();
+    if (!t) {
+      targetStatus.textContent = "";
+      return;
+    }
+    const online = onlineUsers.has(t);
+    targetStatus.textContent = online ? "● online" : "○ offline";
+    targetStatus.className = online ? "online" : "offline";
+  }
+
+  function updateControls() {
+    const ready = socket.connected && authenticated;
+    roomSelect.disabled = !ready;
+    targetInput.disabled = !ready;
+    messageInput.disabled = !ready;
+    sendButton.disabled = !ready;
+    loadHistoryButton.disabled = !ready;
+  }
+
+  function sendMessage() {
+    if (!socket.connected || !authenticated) {
+      addMessage("You are not connected or authenticated.", "error");
+      return;
+    }
+
+    const text = messageInput.value.trim();
+    const to = targetInput.value.trim();
+
+    if (!text) {
+      addMessage("Message cannot be empty.", "error");
+      return;
+    }
+    if (!to && !joinedRoom) {
+      addMessage("Join a room before sending a room message.", "error");
+      return;
+    }
+
+    // Reuse the same clientMsgId when retrying the same message after a timeout,
+    // so the server's UNIQUE index turns the retry into a no-op, not a duplicate.
+    if (!pendingSend || pendingSend.text !== text || pendingSend.to !== to) {
+      pendingSend = { clientMsgId: crypto.randomUUID(), text, to };
+    }
+
+    sendButton.disabled = true;
+
+    socket.timeout(5000).emit(
+      "message",
+      { clientMsgId: pendingSend.clientMsgId, text, to },
+      (error, result) => {
+        sendButton.disabled = !socket.connected || !authenticated;
+
+        if (error) {
+          // keep pendingSend so a retry reuses the same id
+          addMessage("No acknowledgement received. Press send to retry.", "error");
+          return;
+        }
+        if (!result) {
+          addMessage("The server returned no message result.", "error");
+          return;
+        }
+        if (!result.ok) {
+          pendingSend = null;
+          addMessage("[Error] " + result.message, "error");
+          return;
         }
 
-        function updateControls() {
-            const ready = socket.connected && authenticated;
+        pendingSend = null;
 
-            roomSelect.disabled = !ready;
-            targetInput.disabled = !ready;
-            messageInput.disabled = !ready;
-            sendButton.disabled = !ready;
-            loadHistoryButton.disabled = !ready;
+        if (result.target === "private") {
+          addMessage("You → " + result.recipient + ": " + text, "", result.id, "sent");
+        } else {
+          addMessage("You [#" + result.room + "]: " + text, "", result.id);
         }
 
-        function sendMessage() {
-            console.log("Send clicked", {
-                connected: socket.connected,
-                authenticated,
-                joinedRoom
-            });
+        messageInput.value = "";
+        messageInput.focus();
+      }
+    );
+  }
 
-            if (!socket.connected || !authenticated) {
-                addMessage(
-                    "You are not connected or authenticated.",
-                    "error"
-                );
-                return;
-            }
+  function loadPrivateHistory(otherUsername) {
+    if (!socket.connected || !authenticated) {
+      addMessage("Connect and authenticate before loading history.", "error");
+      return;
+    }
 
-            const text = messageInput.value.trim();
-            const to = targetInput.value.trim();
+    const recipient = otherUsername.trim();
+    if (!recipient) {
+      addMessage("Enter a username to load private history.", "error");
+      return;
+    }
 
-            if (!text) {
-                addMessage("Message cannot be empty.", "error");
-                return;
-            }
+    loadHistoryButton.disabled = true;
 
-            if (!to && !joinedRoom) {
-                addMessage(
-                    "Join a room before sending a room message.",
-                    "error"
-                );
-                return;
-            }
+    socket.timeout(5000).emit("private-history", recipient, (error, result) => {
+      loadHistoryButton.disabled = !socket.connected || !authenticated;
 
-            sendButton.disabled = true;
+      if (error) {
+        addMessage("No response received while loading history.", "error");
+        return;
+      }
+      if (!result) {
+        addMessage("The server returned no history result.", "error");
+        return;
+      }
+      if (!result.ok) {
+        addMessage("[Error] " + result.message, "error");
+        return;
+      }
 
-            socket.timeout(5000).emit(
-                "message",
-                { text, to },
-                (error, result) => {
-                    sendButton.disabled =
-                        !socket.connected || !authenticated;
+      addMessage("--- Private history with " + recipient + " ---", "system");
 
-                    if (error) {
-                        addMessage(
-                            "No acknowledgement received from the server.",
-                            "error"
-                        );
-                        console.error("Message acknowledgement timeout");
-                        return;
-                    }
+      if (result.messages.length === 0) {
+        addMessage("No previous private messages found.", "system");
+        return;
+      }
 
-                    if (!result) {
-                        addMessage(
-                            "The server returned no message result.",
-                            "error"
-                        );
-                        return;
-                    }
+      for (const m of result.messages) {
+        const mine = m.sender_username.toLowerCase() === username.toLowerCase();
+        const status = mine
+          ? m.read_at ? "read" : m.delivered_at ? "delivered" : "sent"
+          : null;
 
-                    if (!result.ok) {
-                        addMessage(
-                            "[Error] " + result.message,
-                            "error"
-                        );
-                        return;
-                    }
+        addMessage(
+          "[Private] " + (mine ? "You" : m.sender_username) + ": " + m.content,
+          "",
+          m.id,
+          status
+        );
+      }
+    });
+  }
 
-                    if (result.target === "private") {
-                        addMessage(
-                            "You → " + result.recipient + ": " + text
-                        );
-                    } else {
-                        addMessage(
-                            "You [#" + result.room + "]: " + text
-                        );
-                    }
+  // ---------- socket events ----------
+  socket.on("connect", () => {
+    connectionStatus.textContent = "Connected — authenticating";
+    authenticated = false;
+    username = "";
+    joinedRoom = "";
+    currentRoomDisplay.textContent = "Joining...";
+    usernameDisplay.textContent = "Authenticating...";
+    updateControls();
+    addMessage("Socket connected. Waiting for authenticated identity.", "system");
+  });
 
-                    messageInput.value = "";
-                    messageInput.focus();
-                }
-            );
+  socket.on("current-user", (user) => {
+    username = user.username;
+    authenticated = true;
+    connectionStatus.textContent = "Connected";
+    usernameDisplay.textContent = username;
+    updateControls();
+    addMessage("Authenticated as " + username + ".", "system");
+    socket.emit("join-room", roomSelect.value);
+  });
+
+  // Full list, sent once on every (re)connect. REPLACE state, don't merge.
+  socket.on("presence-snapshot", (usernames) => {
+    onlineUsers.clear();
+    for (const u of usernames) onlineUsers.add(String(u).toLowerCase());
+    renderPresence();
+  });
+
+  // Single change after that
+  socket.on("user-status", (data) => {
+    const u = String(data.username).toLowerCase();
+    if (data.status === "online") onlineUsers.add(u);
+    else onlineUsers.delete(u);
+    renderPresence();
+  });
+
+  // Delivery / read ticks for messages I sent
+  socket.on("message-status", (data) => {
+    const entry = messageEls.get(data.id);
+    if (entry) setTick(entry, data.status);
+    else earlyStatuses.set(data.id, data.status); // arrived before the send-ack rendered
+  });
+
+  socket.on("disconnect", (reason) => {
+    connectionStatus.textContent = "Disconnected";
+    usernameDisplay.textContent = "Not authenticated";
+    currentRoomDisplay.textContent = "None";
+
+    authenticated = false;
+    username = "";
+    joinedRoom = "";
+    isLoadingHistory = false;
+    pendingLiveMessages = [];
+
+    // Presence is unknown while offline; the snapshot rebuilds it on reconnect
+    onlineUsers.clear();
+    renderPresence();
+
+    updateControls();
+    addMessage("Connection lost (" + reason + "). Trying to reconnect...", "error");
+  });
+
+  socket.on("connect_error", (error) => {
+    connectionStatus.textContent = "Connection failed";
+    console.error("Socket connection error:", error.message);
+    updateControls();
+  });
+
+  socket.on("system", (text) => {
+    addMessage("[System] " + text, "system");
+    if (text.startsWith("You joined #")) {
+      joinedRoom = text.substring("You joined #".length);
+      currentRoomDisplay.textContent = joinedRoom;
+    }
+  });
+
+  socket.on("message", (data) => {
+    if (isLoadingHistory && !data.private) {
+      pendingLiveMessages.push(data);
+      return;
+    }
+
+    addMessage(
+      data.private
+        ? "[Private] " + data.from + ": " + data.text
+        : "[" + data.room + "] " + data.from + ": " + data.text,
+      "",
+      data.id
+    );
+
+    // Ack delivery for every private message, even duplicates (the server ignores repeats)
+    if (data.private && typeof data.id === "string") {
+      socket.emit("message-delivered", data.id, (result) => {
+        if (!result || !result.ok) {
+          console.error("Failed to acknowledge delivery:", result && result.message);
         }
+      });
+    }
+  });
 
-        function loadPrivateHistory(otherUsername) {
-            if (!socket.connected || !authenticated) {
-                addMessage(
-                    "Connect and authenticate before loading history.",
-                    "error"
-                );
-                return;
-            }
+  socket.on("room-history", (history) => {
+    for (const m of history) {
+      addMessage(
+        "[" + m.room_name + "] " + m.sender_username + ": " + m.content,
+        "",
+        m.id
+      );
+    }
 
-            const recipient = otherUsername.trim();
+    isLoadingHistory = false;
 
-            if (!recipient) {
-                addMessage(
-                    "Enter a username to load private history.",
-                    "error"
-                );
-                return;
-            }
+    for (const m of pendingLiveMessages) {
+      addMessage("[" + m.room + "] " + m.from + ": " + m.text, "", m.id);
+    }
+    pendingLiveMessages = [];
+  });
 
-            loadHistoryButton.disabled = true;
+  roomSelect.addEventListener("change", () => {
+    if (!socket.connected || !authenticated) return;
+    isLoadingHistory = true;
+    pendingLiveMessages = [];
+    joinedRoom = "";
+    currentRoomDisplay.textContent = "Joining...";
+    socket.emit("join-room", roomSelect.value);
+  });
 
-            socket.timeout(5000).emit(
-                "private-history",
-                recipient,
-                (error, result) => {
-                    loadHistoryButton.disabled =
-                        !socket.connected || !authenticated;
+  targetInput.addEventListener("input", renderTargetStatus);
+  sendButton.addEventListener("click", sendMessage);
+  messageInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sendMessage();
+  });
+  loadHistoryButton.addEventListener("click", () => {
+    loadPrivateHistory(targetInput.value);
+  });
 
-                    if (error) {
-                        addMessage(
-                            "No response received while loading history.",
-                            "error"
-                        );
-                        return;
-                    }
-
-                    if (!result) {
-                        addMessage(
-                            "The server returned no history result.",
-                            "error"
-                        );
-                        return;
-                    }
-
-                    if (!result.ok) {
-                        addMessage(
-                            "[Error] " + result.message,
-                            "error"
-                        );
-                        return;
-                    }
-
-                    addMessage(
-                        "--- Private history with " + recipient + " ---",
-                        "system"
-                    );
-
-                    if (result.messages.length === 0) {
-                        addMessage(
-                            "No previous private messages found.",
-                            "system"
-                        );
-                        return;
-                    }
-
-                    for (const message of result.messages) {
-                        const direction =
-                            message.sender_username.toLowerCase() ===
-                            username.toLowerCase()
-                                ? "You"
-                                : message.sender_username;
-
-                        addMessage(
-                            "[Private] " +
-                            direction +
-                            ": " +
-                            message.content
-                        );
-                    }
-                }
-            );
-        }
-
-        socket.on("connect", () => {
-            connectionStatus.textContent =
-                "Connected — authenticating";
-
-            authenticated = false;
-            username = "";
-            joinedRoom = "";
-            currentRoomDisplay.textContent = "Joining...";
-            usernameDisplay.textContent = "Authenticating...";
-
-            updateControls();
-
-            addMessage(
-                "Socket connected. Waiting for authenticated identity.",
-                "system"
-            );
-        });
-
-        socket.on("current-user", (user) => {
-            username = user.username;
-            authenticated = true;
-
-            connectionStatus.textContent = "Connected";
-            usernameDisplay.textContent = username;
-
-            updateControls();
-
-            addMessage(
-                "Authenticated as " + username + ".",
-                "system"
-            );
-
-            // The server will confirm room joining through its system event.
-            socket.emit("join-room", roomSelect.value);
-        });
-
-        socket.on("disconnect", (reason) => {
-            connectionStatus.textContent = "Disconnected";
-            usernameDisplay.textContent = "Not authenticated";
-            currentRoomDisplay.textContent = "None";
-
-            authenticated = false;
-            username = "";
-            joinedRoom = "";
-            isLoadingHistory = false;
-            pendingLiveMessages = [];
-
-            updateControls();
-
-            addMessage(
-                "Connection lost (" + reason + "). Trying to reconnect...",
-                "error"
-            );
-        });
-
-        socket.on("connect_error", (error) => {
-            connectionStatus.textContent = "Connection failed";
-
-            console.error("Socket connection error:", error.message);
-
-            updateControls();
-        });
-
-        socket.on("system", (text) => {
-            addMessage("[System] " + text, "system");
-
-            if (text.startsWith("You joined #")) {
-                joinedRoom = text.substring("You joined #".length);
-                currentRoomDisplay.textContent = joinedRoom;
-            }
-        });
-
-        roomSelect.addEventListener("change", () => {
-            if (!socket.connected || !authenticated) {
-                return;
-            }
-
-            isLoadingHistory = true;
-            pendingLiveMessages = [];
-            joinedRoom = "";
-
-            currentRoomDisplay.textContent = "Joining...";
-
-            socket.emit("join-room", roomSelect.value);
-        });
-
-        sendButton.addEventListener("click", sendMessage);
-
-        messageInput.addEventListener("keydown", (event) => {
-            if (event.key === "Enter") {
-                sendMessage();
-            }
-        });
-
-        loadHistoryButton.addEventListener("click", () => {
-            loadPrivateHistory(targetInput.value);
-        });
-
-        socket.on("message", (data) => {
-            if (isLoadingHistory && !data.private) {
-                pendingLiveMessages.push(data);
-                return;
-            }
-
-            addMessage(
-                data.private
-                    ? "[Private] " + data.from + ": " + data.text
-                    : "[" + data.room + "] " + data.from + ": " + data.text
-            );
-        });
-
-        socket.on("room-history", (history) => {
-            for (const message of history) {
-                addMessage(
-                    "[" + message.room_name + "] " +
-                    message.sender_username + ": " +
-                    message.content
-                );
-            }
-
-            isLoadingHistory = false;
-
-            for (const message of pendingLiveMessages) {
-                addMessage(
-                    "[" + message.room + "] " +
-                    message.from + ": " +
-                    message.text
-                );
-            }
-
-            pendingLiveMessages = [];
-        });
-
-        updateControls();
-    </script>
+  updateControls();
+</script>
 </body>
 </html>

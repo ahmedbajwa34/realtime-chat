@@ -3,7 +3,9 @@ import type { ChatSocket, SocketSession } from "../socket/socket.types.js";
 import type { PrivateHistoryAck } from "../types/event.js";
 import { getPrivateHistory } from "../db/message.repository.js";
 import { findUserByUsername } from "../db/auth.repository.js";
-import { isUsernameActive } from "../socket/active-users.js";
+
+
+
 
 export function registerPrivateHistoryHandler(
     socket: ChatSocket,
@@ -29,26 +31,23 @@ export function registerPrivateHistoryHandler(
             return;
         }
 
-        try {
-            const recipient = await findUserByUsername(otherUsername.trim());
+       try {
+    const recipient = await findUserByUsername(otherUsername.trim());
 
-            if (
-                !recipient ||
-                !isUsernameActive(recipient.username)
-            ) {
-                respond({ ok: false, message: "That user is not online." });
-                return;
-            }
+    if (!recipient) {
+        respond({ ok: false, message: "That user does not exist." });
+        return;
+    }
 
-            const messages = await getPrivateHistory(
-                session.username,
-                recipient.username
-            );
+    const messages = await getPrivateHistory(
+        session.username,
+        recipient.username.toLowerCase()
+    );
 
-            respond({ ok: true, messages });
-        } catch (error) {
-            console.error("Failed to load private history:", error);
-            respond({ ok: false, message: "Could not load private history." });
-        }
+    respond({ ok: true, messages });
+} catch (error) {
+    console.error("Failed to load private history:", error);
+    respond({ ok: false, message: "Could not load private history." });
+}
     });
 }
