@@ -147,7 +147,14 @@
 
     <h2>Messages</h2>
     <ul id="messages" aria-live="polite"></ul>
-
+  <div id="online-users">
+    <h3>Online Users</h3>
+    <ul id="onlineUsers"></ul>
+    <p>
+        Recipient status:
+        <strong id="targetStatus"></strong>
+    </p>
+</div>
    <script src="/socket.io/socket.io.js"></script>
 <script>
   // Reconnection is ON: the server now handles refreshes and multiple tabs safely.
@@ -171,6 +178,43 @@
   const earlyStatuses = new Map();
   // usernames currently online (lowercase)
   const onlineUsers = new Set();
+
+  // Receive the initial list of online users when connected
+socket.on("presence-snapshot", (usernames) => {
+    onlineUsers.clear();
+
+    usernames.forEach((username) => {
+        onlineUsers.add(username.trim().toLowerCase());
+    });
+
+    renderOnlineUsers();
+});
+
+// Receive live online/offline updates
+socket.on("user-status", ({ username, status }) => {
+    const key = username.trim().toLowerCase();
+
+    if (status === "online") {
+        onlineUsers.add(key);
+    } else if (status === "offline") {
+        onlineUsers.delete(key);
+    }
+
+    renderOnlineUsers();
+});
+
+// Display online users in your existing HTML element
+function renderOnlineUsers() {
+    if (!onlineUsersList) return;
+
+    onlineUsersList.innerHTML = "";
+
+    onlineUsers.forEach((username) => {
+        const li = document.createElement("li");
+        li.textContent = `🟢 ${username} — Online`;
+        onlineUsersList.appendChild(li);
+    });
+}
 
   let username = "";
   let authenticated = false;
