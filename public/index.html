@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,6 +8,10 @@
     <style>
         * {
             box-sizing: border-box;
+        }
+
+        [hidden] {
+            display: none !important;
         }
 
         body {
@@ -80,6 +83,25 @@
             color: #b42318;
         }
 
+        .online {
+            color: #1a9a3c;
+            cursor: pointer;
+        }
+
+        .offline {
+            color: #888;
+        }
+
+        .tick {
+            margin-left: 6px;
+            font-size: 0.8em;
+            color: #888;
+        }
+
+        .tick.read {
+            color: #2a7de1;
+        }
+
         button:disabled,
         input:disabled,
         select:disabled {
@@ -96,6 +118,8 @@
         <p>
             Connection:
             <strong id="connectionStatus">Connecting...</strong>
+            <button id="retryButton" type="button" hidden>Retry connection</button>
+            <button id="logoutButton" type="button">Log out</button>
         </p>
 
         <p>
@@ -138,7 +162,7 @@
             id="messageInput"
             type="text"
             placeholder="Type a message..."
-            maxlength="2000"
+            maxlength="500"
             disabled
         >
     </label>
@@ -147,30 +171,45 @@
 
     <h2>Messages</h2>
     <ul id="messages" aria-live="polite"></ul>
-  <div id="online-users">
-    <h3>Online Users</h3>
-    <ul id="onlineUsers"></ul>
-    <p>
-        Recipient status:
-        <strong id="targetStatus"></strong>
-    </p>
-</div>
-   <script src="/socket.io/socket.io.js"></script>
+
+    <div id="online-users">
+        <h3>Online Users</h3>
+        <ul id="onlineUsers"></ul>
+        <p>
+            Recipient status:
+            <strong id="targetStatus"></strong>
+        </p>
+    </div>
+
+<script src="/socket.io/socket.io.js"></script>
 <script>
-  // Reconnection is ON: the server now handles refreshes and multiple tabs safely.
-  const socket = io({ timeout: 5000 });
+  // ---------- connection setup ----------
+  // Initial connect failures AND later drops both use this retry budget.
+  // After MAX_RETRIES failed attempts Socket.IO stops and fires "reconnect_failed".
+  const MAX_RETRIES = 3;
+
+  const socket = io({
+    timeout: 5000,                  // per-attempt connect timeout
+    reconnection: true,
+    reconnectionAttempts: MAX_RETRIES,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 4000,
+    randomizationFactor: 0.5,
+  });
 
   const connectionStatus = document.getElementById("connectionStatus");
+  const retryButton = document.getElementById("retryButton");
   const usernameDisplay = document.getElementById("usernameDisplay");
   const currentRoomDisplay = document.getElementById("currentRoomDisplay");
   const roomSelect = document.getElementById("roomSelect");
   const targetInput = document.getElementById("targetInput");
-  const targetStatus = document.getElementById("targetStatus");   // new (optional)
-  const onlineUsersList = document.getElementById("onlineUsers"); // new (optional)
+  const targetStatus = document.getElementById("targetStatus");
+  const onlineUsersList = document.getElementById("onlineUsers");
   const messageInput = document.getElementById("messageInput");
   const sendButton = document.getElementById("sendButton");
   const loadHistoryButton = document.getElementById("loadHistoryButton");
   const messages = document.getElementById("messages");
+  const logoutButton = document.getElementById("logoutButton");
 
   // id -> { li, tick }. Used for dedupe AND for updating ticks later.
   const messageEls = new Map();
@@ -179,52 +218,27 @@
   // usernames currently online (lowercase)
   const onlineUsers = new Set();
 
-  // Receive the initial list of online users when connected
-socket.on("presence-snapshot", (usernames) => {
-    onlineUsers.clear();
-
-    usernames.forEach((username) => {
-        onlineUsers.add(username.trim().toLowerCase());
-    });
-
-    renderOnlineUsers();
-});
-
-// Receive live online/offline updates
-socket.on("user-status", ({ username, status }) => {
-    const key = username.trim().toLowerCase();
-
-    if (status === "online") {
-        onlineUsers.add(key);
-    } else if (status === "offline") {
-        onlineUsers.delete(key);
-    }
-
-    renderOnlineUsers();
-});
-
-// Display online users in your existing HTML element
-function renderOnlineUsers() {
-    if (!onlineUsersList) return;
-
-    onlineUsersList.innerHTML = "";
-
-    onlineUsers.forEach((username) => {
-        const li = document.createElement("li");
-        li.textContent = `🟢 ${username} — Online`;
-        onlineUsersList.appendChild(li);
-    });
-}
-
   let username = "";
   let authenticated = false;
   let joinedRoom = "";
+
   let isLoadingHistory = false;
   let pendingLiveMessages = [];
-  let pendingSend = null; // { clientMsgId, text, to } kept until the server acks
+  let historyTimer = null;
+
+  // Outbox: the one unconfirmed message. Kept until the server acks it, and
+  // resent with the SAME clientMsgId, so the server's UNIQUE index makes a
+  // retry a no-op instead of a duplicate row.
+  let outbox = null;          // { clientMsgId, text, to, room }
+  let inFlight = false;
+  let attemptId = 0;          // lets us ignore callbacks from a dead connection
+
+  let authRetried = false;    // one refresh attempt per auth failure
+  let hasAuthenticatedOnce = false;  // keeps reconnects from spamming the log
 
   const TICKS = { sent: "✓", delivered: "✓✓", read: "✓✓" };
 
+  // ---------- rendering helpers ----------
   function setTick(entry, status) {
     if (!entry || !entry.tick) return;
     entry.tick.textContent = TICKS[status] || "";
@@ -270,25 +284,22 @@ function renderOnlineUsers() {
 
   // ---------- presence ----------
   function renderPresence() {
-    if (onlineUsersList) {
-      onlineUsersList.textContent = "";
-      for (const name of [...onlineUsers].sort()) {
-        if (name === username.toLowerCase()) continue; // don't list yourself
-        const li = document.createElement("li");
-        li.textContent = "● " + name;
-        li.className = "online";
-        li.addEventListener("click", () => {
-          targetInput.value = name;
-          renderTargetStatus();
-        });
-        onlineUsersList.appendChild(li);
-      }
+    onlineUsersList.textContent = "";
+    for (const name of [...onlineUsers].sort()) {
+      if (name === username.toLowerCase()) continue; // don't list yourself
+      const li = document.createElement("li");
+      li.textContent = "● " + name;
+      li.className = "online";
+      li.addEventListener("click", () => {
+        targetInput.value = name;
+        renderTargetStatus();
+      });
+      onlineUsersList.appendChild(li);
     }
     renderTargetStatus();
   }
 
   function renderTargetStatus() {
-    if (!targetStatus) return;
     const t = targetInput.value.trim().toLowerCase();
     if (!t) {
       targetStatus.textContent = "";
@@ -304,13 +315,52 @@ function renderOnlineUsers() {
     roomSelect.disabled = !ready;
     targetInput.disabled = !ready;
     messageInput.disabled = !ready;
-    sendButton.disabled = !ready;
+    sendButton.disabled = !ready || inFlight;
     loadHistoryButton.disabled = !ready;
   }
 
+  // ---------- room history loading ----------
+  // Live room messages that arrive while history is loading are held, then
+  // shown after the history, so nothing is lost or shown out of order.
+  function startHistoryLoad() {
+    isLoadingHistory = true;
+    pendingLiveMessages = [];
+    clearTimeout(historyTimer);
+    // Safety net: never hold live messages forever if the join fails
+    historyTimer = setTimeout(finishHistoryLoad, 8000);
+  }
+
+  function finishHistoryLoad() {
+    clearTimeout(historyTimer);
+    isLoadingHistory = false;
+    for (const m of pendingLiveMessages) {
+      addMessage("[" + m.room + "] " + m.from + ": " + m.text, "", m.id);
+    }
+    pendingLiveMessages = [];
+  }
+
+  function cancelHistoryLoad() {
+    clearTimeout(historyTimer);
+    isLoadingHistory = false;
+    pendingLiveMessages = [];
+  }
+
+  // ---------- sending (outbox) ----------
   function sendMessage() {
     if (!socket.connected || !authenticated) {
       addMessage("You are not connected or authenticated.", "error");
+      return;
+    }
+
+    // An earlier message is still unconfirmed: retry THAT one (same clientMsgId)
+    if (outbox) {
+      if (inFlight) {
+        addMessage("Previous message is still being sent...", "system");
+        return;
+      }
+      messageInput.value = outbox.text;
+      addMessage("Retrying your unsent message.", "system");
+      transmit();
       return;
     }
 
@@ -326,41 +376,50 @@ function renderOnlineUsers() {
       return;
     }
 
-    // Reuse the same clientMsgId when retrying the same message after a timeout,
-    // so the server's UNIQUE index turns the retry into a no-op, not a duplicate.
-    if (!pendingSend || pendingSend.text !== text || pendingSend.to !== to) {
-      pendingSend = { clientMsgId: crypto.randomUUID(), text, to };
-    }
+    outbox = {
+      clientMsgId: crypto.randomUUID(),
+      text,
+      to,
+      room: to ? "" : joinedRoom,
+    };
+    transmit();
+  }
 
-    sendButton.disabled = true;
+  function transmit() {
+    if (!outbox || inFlight || !socket.connected || !authenticated) return;
+
+    inFlight = true;
+    const myAttempt = ++attemptId;
+    const sent = outbox;
+    updateControls();
 
     socket.timeout(5000).emit(
       "message",
-      { clientMsgId: pendingSend.clientMsgId, text, to },
+      { clientMsgId: sent.clientMsgId, text: sent.text, to: sent.to },
       (error, result) => {
-        sendButton.disabled = !socket.connected || !authenticated;
+        // The connection died and a newer attempt took over: ignore this one
+        if (myAttempt !== attemptId) return;
+
+        inFlight = false;
+        updateControls();
 
         if (error) {
-          // keep pendingSend so a retry reuses the same id
-          addMessage("No acknowledgement received. Press send to retry.", "error");
+          // Keep the outbox. It is resent on reconnect or when Send is pressed.
+          addMessage("No acknowledgement. Will retry on reconnect or press Send.", "system");
           return;
         }
-        if (!result) {
-          addMessage("The server returned no message result.", "error");
-          return;
-        }
-        if (!result.ok) {
-          pendingSend = null;
-          addMessage("[Error] " + result.message, "error");
+        if (!result || !result.ok) {
+          outbox = null;
+          addMessage("[Error] " + (result ? result.message : "No result from server."), "error");
           return;
         }
 
-        pendingSend = null;
+        outbox = null;
 
         if (result.target === "private") {
-          addMessage("You → " + result.recipient + ": " + text, "", result.id, "sent");
+          addMessage("You → " + result.recipient + ": " + sent.text, "", result.id, "sent");
         } else {
-          addMessage("You [#" + result.room + "]: " + text, "", result.id);
+          addMessage("You [#" + result.room + "]: " + sent.text, "", result.id);
         }
 
         messageInput.value = "";
@@ -369,6 +428,7 @@ function renderOnlineUsers() {
     );
   }
 
+  // ---------- private history ----------
   function loadPrivateHistory(otherUsername) {
     if (!socket.connected || !authenticated) {
       addMessage("Connect and authenticate before loading history.", "error");
@@ -422,16 +482,22 @@ function renderOnlineUsers() {
     });
   }
 
-  // ---------- socket events ----------
+  // ---------- connection lifecycle ----------
   socket.on("connect", () => {
-    connectionStatus.textContent = "Connected — authenticating";
-    authenticated = false;
-    username = "";
+    authRetried = false;
+    retryButton.hidden = true;
+
+    connectionStatus.textContent = "Connected — restoring session";
+    authenticated = false;       // gates sending until the server confirms us
     joinedRoom = "";
     currentRoomDisplay.textContent = "Joining...";
-    usernameDisplay.textContent = "Authenticating...";
+    // Keep showing the known username on a reconnect; only a first-ever
+    // connect has nothing to show yet.
+    usernameDisplay.textContent = username || "Authenticating...";
     updateControls();
-    addMessage("Socket connected. Waiting for authenticated identity.", "system");
+    if (!hasAuthenticatedOnce) {
+      addMessage("Socket connected. Waiting for authenticated identity.", "system");
+    }
   });
 
   socket.on("current-user", (user) => {
@@ -440,25 +506,147 @@ function renderOnlineUsers() {
     connectionStatus.textContent = "Connected";
     usernameDisplay.textContent = username;
     updateControls();
-    addMessage("Authenticated as " + username + ".", "system");
+    if (!hasAuthenticatedOnce) {
+      addMessage("Authenticated as " + username + ".", "system");
+      hasAuthenticatedOnce = true;
+    }
+
+    // A pending room message must go to the room it was written for
+    if (outbox && !outbox.to && outbox.room) {
+      roomSelect.value = outbox.room;
+    }
+
+    // Hold live room messages until the room history arrives
+    startHistoryLoad();
     socket.emit("join-room", roomSelect.value);
+
+    // Resend any unconfirmed message AFTER the join, with the same clientMsgId.
+    // Events are processed in order, so the room is set before this arrives.
+    transmit();
   });
 
-  // Full list, sent once on every (re)connect. REPLACE state, don't merge.
+  socket.on("disconnect", (reason) => {
+    connectionStatus.textContent = "Disconnected";
+    // Keep the username: a dropped connection is not a logout, and the
+    // browser re-sends its login cookie automatically on reconnect.
+    usernameDisplay.textContent = username ? username + " (offline)" : "Not authenticated";
+    currentRoomDisplay.textContent = "None";
+
+    authenticated = false;       // can't send until the server confirms us again
+    joinedRoom = "";
+
+    // Any ack still pending belongs to the dead connection
+    inFlight = false;
+    attemptId++;
+
+    cancelHistoryLoad();
+
+    // Presence is unknown while offline; the snapshot rebuilds it on reconnect
+    onlineUsers.clear();
+    renderPresence();
+
+    updateControls();
+
+    if (reason === "io server disconnect") {
+      // The server closed the socket on purpose (e.g. a restart).
+      // Socket.IO does NOT auto-reconnect in this case, so do it manually.
+      addMessage("Server closed the connection. Reconnecting...", "error");
+      socket.connect();
+    } else if (reason === "io client disconnect") {
+      addMessage("Disconnected.", "error");
+    } else {
+      addMessage("Connection lost (" + reason + "). Trying to reconnect...", "error");
+    }
+  });
+
+  socket.on("connect_error", async (error) => {
+    console.error("Socket connection error:", error.message);
+
+    if (error.message === "unauthorized") {
+      // Auth failures are not retried by Socket.IO. Try one refresh, then login.
+      if (authRetried) {
+        window.location.href = "/login.html";
+        return;
+      }
+      authRetried = true;
+      connectionStatus.textContent = "Refreshing session...";
+      try {
+        const res = await fetch("/auth/refresh", {
+          method: "POST",
+          credentials: "same-origin",
+        });
+        if (res.ok) {
+          socket.connect();     // retry with the new access cookie
+          return;
+        }
+      } catch (e) {
+        console.error("Refresh request failed:", e);
+      }
+      window.location.href = "/login.html";
+      return;
+    }
+
+    // Network/server errors: Socket.IO retries on its own (reconnect_attempt)
+    connectionStatus.textContent = "Connection failed";
+    updateControls();
+  });
+
+  // Fires for every retry, including when the very first connect fails
+  socket.io.on("reconnect_attempt", (attempt) => {
+    connectionStatus.textContent = "Reconnecting (" + attempt + "/" + MAX_RETRIES + ")...";
+  });
+
+  socket.io.on("reconnect", () => {
+    addMessage("Reconnected.", "system");
+  });
+
+  // All retries used up: stop and let the user decide
+  socket.io.on("reconnect_failed", () => {
+    connectionStatus.textContent = "Connection lost";
+    addMessage("Could not reach the server after " + MAX_RETRIES + " attempts. Click Retry.", "error");
+    retryButton.hidden = false;
+    updateControls();
+  });
+
+  retryButton.addEventListener("click", () => {
+    retryButton.hidden = true;
+    connectionStatus.textContent = "Connecting...";
+    socket.connect();           // starts a fresh set of attempts
+  });
+
+  // Recovery: if the network comes back after retries stopped, try again once
+  window.addEventListener("online", () => {
+    if (!socket.connected && !retryButton.hidden) retryButton.click();
+  });
+
+  logoutButton.addEventListener("click", async () => {
+  logoutButton.disabled = true;
+  socket.disconnect();   // a client-initiated disconnect never auto-reconnects
+  try {
+    await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
+  } catch (e) {
+    console.error("Logout request failed:", e);
+  }
+  window.location.href = "/login.html";
+});
+
+  // ---------- presence events ----------
+  // Full list, sent on every (re)connect. REPLACE state, don't merge.
   socket.on("presence-snapshot", (usernames) => {
     onlineUsers.clear();
-    for (const u of usernames) onlineUsers.add(String(u).toLowerCase());
+    for (const u of usernames) onlineUsers.add(String(u).trim().toLowerCase());
     renderPresence();
   });
 
   // Single change after that
   socket.on("user-status", (data) => {
-    const u = String(data.username).toLowerCase();
+    const u = String(data.username).trim().toLowerCase();
     if (data.status === "online") onlineUsers.add(u);
     else onlineUsers.delete(u);
     renderPresence();
   });
 
+  // ---------- messages ----------
   // Delivery / read ticks for messages I sent
   socket.on("message-status", (data) => {
     const entry = messageEls.get(data.id);
@@ -466,36 +654,17 @@ function renderOnlineUsers() {
     else earlyStatuses.set(data.id, data.status); // arrived before the send-ack rendered
   });
 
-  socket.on("disconnect", (reason) => {
-    connectionStatus.textContent = "Disconnected";
-    usernameDisplay.textContent = "Not authenticated";
-    currentRoomDisplay.textContent = "None";
-
-    authenticated = false;
-    username = "";
-    joinedRoom = "";
-    isLoadingHistory = false;
-    pendingLiveMessages = [];
-
-    // Presence is unknown while offline; the snapshot rebuilds it on reconnect
-    onlineUsers.clear();
-    renderPresence();
-
-    updateControls();
-    addMessage("Connection lost (" + reason + "). Trying to reconnect...", "error");
-  });
-
-  socket.on("connect_error", (error) => {
-    connectionStatus.textContent = "Connection failed";
-    console.error("Socket connection error:", error.message);
-    updateControls();
-  });
-
   socket.on("system", (text) => {
     addMessage("[System] " + text, "system");
+
     if (text.startsWith("You joined #")) {
       joinedRoom = text.substring("You joined #".length);
       currentRoomDisplay.textContent = joinedRoom;
+    }
+
+    // Join failed: no history is coming, so release any held messages
+    if (text === "That room does not exist" || text === "Could not load room history") {
+      finishHistoryLoad();
     }
   });
 
@@ -531,19 +700,13 @@ function renderOnlineUsers() {
         m.id
       );
     }
-
-    isLoadingHistory = false;
-
-    for (const m of pendingLiveMessages) {
-      addMessage("[" + m.room + "] " + m.from + ": " + m.text, "", m.id);
-    }
-    pendingLiveMessages = [];
+    finishHistoryLoad();
   });
 
+  // ---------- UI events ----------
   roomSelect.addEventListener("change", () => {
     if (!socket.connected || !authenticated) return;
-    isLoadingHistory = true;
-    pendingLiveMessages = [];
+    startHistoryLoad();
     joinedRoom = "";
     currentRoomDisplay.textContent = "Joining...";
     socket.emit("join-room", roomSelect.value);

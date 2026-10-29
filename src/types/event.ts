@@ -36,6 +36,7 @@ export type MessageAck =
               | "INVALID_MESSAGE"
               | "RECIPIENT_NOT_FOUND"
               | "NOT_IN_ROOM"
+              | "RATE_LIMITED"
               | "DATABASE_ERROR";
           message: string;
       };

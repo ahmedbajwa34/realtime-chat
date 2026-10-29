@@ -21,7 +21,7 @@ export function registerConnectionHandlers(io: ChatServer): void {
         registerPrivateHistoryHandler(socket, session);
 
         try {
-            await socket.join(`user:${username}`);
+           await socket.join([`user:${username}`, `uid:${userId}`]);
 
             socket.emit("current-user", { id: userId, username });
             socket.emit("presence-snapshot", getOnlineUsernames());

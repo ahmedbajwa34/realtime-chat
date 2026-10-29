@@ -3,12 +3,14 @@ import type { MessageAck, DeliveryAck } from "../types/event.js";
 import { parseMessage } from "../schemas/message.schema.js";
 import { saveMessage, markMessageDelivered } from "../db/message.repository.js";
 import { findUserByUsername } from "../db/auth.repository.js";
+import { createRateLimiter } from "../config/rate-limiter.js";
 
 export function registerMessageHandler(
     io: ChatServer,
     socket: ChatSocket,
     session: SocketSession
 ): void {
+    const allowMessage = createRateLimiter(10, 10_000);
     socket.on("message", async (data, acknowledge) => {
         function respond(result: MessageAck): void {
             if (typeof acknowledge === "function") acknowledge(result);
@@ -18,6 +20,10 @@ export function registerMessageHandler(
             respond({ ok: false, error: "REGISTER_REQUIRED", message: "Register a username first." });
             return;
         }
+        if (!allowMessage()) {
+       respond({ ok: false, error: "RATE_LIMITED", message: "You are sending messages too fast." });
+       return;
+   }
 
         const msg = parseMessage(data); 
         if (!msg) {

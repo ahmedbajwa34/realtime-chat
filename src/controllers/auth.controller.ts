@@ -1,11 +1,11 @@
 import {
-    createAccessToken, createRefreshToken, verifyRefreshToken,
+    createAccessToken, createRefreshToken, verifyRefreshToken, verifyAccessToken
 } from "../services/token.service.js";
 import { authConfig } from "../config/auth.config.js";
 import { RegisterSchema, LoginSchema } from "../schemas/auth.schema.js";
 import { registerUser, loginUser } from "../services/auth.service.js";
 import type{ Request, Response, NextFunction } from "express";
-
+import type { ChatServer } from "../socket/socket.types.js";
 
 
 const baseCookie = {
@@ -100,8 +100,27 @@ export function refresh(req: Request, res: Response): void
     }
 }
 
-export function logout(_req: Request, res: Response): void {
+function getUserIdFromCookies(req: Request): string | null {
+    const refresh = req.cookies?.[authConfig.refreshToken.cookieName];
+    if (refresh) {
+        try { return verifyRefreshToken(refresh).userId; } catch { /* fall through */ }
+    }
+    const access = req.cookies?.[authConfig.accessToken.cookieName];
+    if (access) {
+        try { return verifyAccessToken(access).userId; } catch { /* fall through */ }
+    }
+    return null;
+}
+
+export function logout(req: Request, res: Response): void {
+    const userId = getUserIdFromCookies(req);
+
     clearSession(res);
-    res.status(200).json({ 
-        message: "Logged out" });
+
+    if (userId) {
+        const io = req.app.get("io") as ChatServer | undefined;
+        io?.in(`uid:${userId}`).disconnectSockets(true);
+    }
+
+    res.status(200).json({ message: "Logged out" });
 }

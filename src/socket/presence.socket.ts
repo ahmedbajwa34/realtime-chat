@@ -1,7 +1,8 @@
 const connections = new Map<string, Set<string>>();
 const keyOf = (u: string) => u.trim().toLowerCase();
 
-/** Returns true if this is the user's first live socket (offline -> online). */
+
+
 export function addConnection(username: string, socketId: string): boolean {
     const key = keyOf(username);
     let sockets = connections.get(key);
